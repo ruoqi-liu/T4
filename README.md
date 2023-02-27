@@ -14,7 +14,8 @@ Ubuntu16.04, python 3.6
 
 Install [pytorch 1.4](https://pytorch.org/)
 
-# Datasets
+# Data
+## Real-world data
 #### Studied variables
 The list of variables in MIMIC-III and AdmsterdamDB. There are 22 temporal covariates and 4 demographics andstatic variables. PT: Prothrombin Time; BUN: Blood Urea Nitrogen; WBC: White Blood Cells count.
 
@@ -54,6 +55,18 @@ The list of antibiotics in MIMIC-III Dataset. There are 18 kinds of antibiotics 
 |---	|---	|
 | Antibiotic 	| Cefazolin, Cefepime, Ceftazidime, Ciprofloxacin, Clindamycin,  Erythromycin, Gentamicin, Levofloxacin, Metronidazole, Moxifloxacin, Piperacillin, Rifampin, Tobramycin, Vancomycin,  Amikacin, Ampicillin, Azithromycin, Aztreonam 	|
 
+## Synthetic data
+#### Fully synthetic data
+```
+mkdir -p data
+python simulation/gen_synthetic.py
+```
+
+#### Semi-synthetic data based on MIMIC-III
+```
+# put preprocessed MIMIC-III data into folder "data/"
+python simulation/gen_synthetic_mimic.py
+```
 
 # Train T4
 #### Running example 
