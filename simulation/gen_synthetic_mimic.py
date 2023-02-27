@@ -67,6 +67,6 @@ def simulate_mimic(data_dir, dataset_name, output):
     print(f'Save synthetic-MIMIC data in {output}')
 
 if __name__ == '__main__':
-    simulate_mimic('../data/', 'mimic3', f'../data/synthetic_mimic3.pkl')
+    simulate_mimic('data/', 'mimic3', 'data/synthetic_mimic3.pkl')
 
 
