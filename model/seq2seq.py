@@ -2,6 +2,9 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 import random
+from torch.autograd import Function
+from torch.nn import Module
+from torch import tensor
 
 class Attn(nn.Module):
     def __init__(self, method, hidden_size):
@@ -90,13 +93,12 @@ class Encoder(nn.Module):
             torch.nn.Linear(hid_dim, 1, bias=False)
         )
 
-        self.test = torch.nn.Sequential(
-            nn.Linear(emb_dim, hid_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hid_dim, 1, bias=False)
-        )
-
         self.device = device
+
+        self.lambd = 0
+
+    def set_lambda(self, lambd):
+        self.lambd = lambd
 
     def softmax_masked(self, inputs, mask, dim=0, epsilon=0.0000001):
         # inputs = mask = [src len, batch size]
@@ -122,7 +124,6 @@ class Encoder(nn.Module):
 
         outputs, (h,c) = self.rnn(embedded)  # no cell state!
 
-        # predict y_t using outputs and a_t
         src_mask = (src.sum(dim=-1) != 0).long()
         att_enc = self.attention_encoder(outputs).squeeze(-1)
 
@@ -132,9 +133,9 @@ class Encoder(nn.Module):
 
         hidden_con = torch.cat((hidden, embedded_static), dim=-1)
 
-        y_t_pred = self.fc_out(torch.cat((hidden_con, treatment_cur), dim=-1))
+        ps_pred = self.ps_out(hidden_con).squeeze(-1)
 
-        return h, c, outputs, hidden, y_t_pred, src_mask
+        return h, c, outputs, hidden, ps_pred, src_mask
 
 
 class AttentionDecoder(nn.Module):
@@ -149,40 +150,26 @@ class AttentionDecoder(nn.Module):
 
         self.embedding_static = nn.Linear(x_static_size, emb_dim)
 
-        self.treatment_embedding = nn.Linear(1, emb_dim)
-
-        self.treatment_next_embedding = nn.Linear(1, emb_dim)
-
-        self.treatment_next_embedding_cf = nn.Linear(1, emb_dim)
-
         self.x_static_size = x_static_size
-
-        self.attn = nn.Linear(hid_dim * 2, 8)
-        self.attn_combine = nn.Linear(hid_dim * 2, hid_dim)
 
         self.attn_f = Attn('general', hid_dim)
 
-        self.rnn = nn.LSTM(emb_dim*3, hid_dim, n_layers, dropout=dropout, batch_first=True)
+        self.rnn = nn.LSTM(emb_dim*2+1, hid_dim, n_layers, dropout=dropout, batch_first=True)
 
-        # self.fc_out = torch.nn.Sequential(
-        #     nn.Linear(hid_dim*2+1, hid_dim),
-        #     torch.nn.ReLU(),
-        #     nn.Linear(hid_dim, output_dim),
-        # )
+        self.fc_out_1 = torch.nn.Sequential(
+            nn.Linear(hid_dim * 2, hid_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hid_dim, 1))
 
-        # self.fc_out_cf = torch.nn.Sequential(
-        #     nn.Linear(hid_dim*2+1, hid_dim),
-        #     torch.nn.ReLU(),
-        #     nn.Linear(hid_dim, output_dim),
-        # )
-        self.fc_out = nn.Linear(hid_dim * 2 + emb_dim, output_dim)
+        self.fc_out_0 = torch.nn.Sequential(
+            nn.Linear(hid_dim * 2, hid_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hid_dim, 1))
 
         self.ps_out = torch.nn.Sequential(
             nn.Linear(hid_dim * 2, hid_dim),
             torch.nn.ReLU(),
             torch.nn.Linear(hid_dim, 1))
-
-        self.fc_out_cf = nn.Linear(hid_dim * 2 + emb_dim, output_dim)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -191,17 +178,19 @@ class AttentionDecoder(nn.Module):
         input = input.unsqueeze(-1)
         embedded = self.embedding(input)
 
+        # print(x_static.shape)
         embedded_static = self.embedding_static(x_static)
+
+        embedded = embedded.unsqueeze(0) if len(embedded.shape) != 2 else embedded
 
         embedded = torch.cat((embedded, embedded_static), dim=-1)
 
-        treatment_cur = self.treatment_embedding(treatment_cur.unsqueeze(-1))
+
+        treatment_cur = treatment_cur.unsqueeze(-1)
 
         emb_con = torch.cat((embedded, treatment_cur), dim=-1)
 
         emb_con = self.dropout(emb_con)
-
-        ps_output = self.ps_out(torch.cat((hidden[0], hidden[1]), dim=-1)).squeeze(-1)
 
         output, (hidden,cell)= self.rnn(emb_con.unsqueeze(1), (hidden, cell))
 
@@ -211,13 +200,11 @@ class AttentionDecoder(nn.Module):
 
         output = torch.cat((output.squeeze(1), context), dim=-1)
 
-        treatment_next_emb = self.treatment_next_embedding(treatment_next.unsqueeze(-1))
+        ps_output = self.ps_out(output).squeeze(-1)
 
-        output_f = torch.cat((output, treatment_next_emb), dim=-1)
-        prediction = self.fc_out(output_f)
-
-        output_cf = torch.cat((output, self.treatment_next_embedding_cf((1 - treatment_next).unsqueeze(-1))), dim=-1)
-        prediction_cf = self.fc_out_cf(output_cf)
+        treatment_next = treatment_next.unsqueeze(-1)
+        prediction = treatment_next * self.fc_out_1(output) + (1-treatment_next) * self.fc_out_0(output)
+        prediction_cf = treatment_next * self.fc_out_0(output) + (1 - treatment_next) * self.fc_out_1(output)
 
         return (prediction, prediction_cf), (hidden, cell), output, ps_output, attn_weights
 
@@ -245,31 +232,35 @@ class Seq2Seq(nn.Module):
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
         outputs_cf = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
         decoder_attentions = torch.zeros(batch_size, trg_len, src_len).to(self.device)
-        ps_outputs = torch.zeros(batch_size, trg_len).to(self.device)
-        # patient_representations = 0
+        ps_outputs = torch.zeros(batch_size, trg_len+1).to(self.device)
 
         # last hidden state of the encoder is the context
-        hidden, cell, encoder_outputs, patient_representations,  y_t_pred, src_mask = self.encoder(src, x_static, treatment[:, :src_len])
+        hidden, cell, encoder_outputs, patient_representations,  ps_pred, src_mask = self.encoder(src, x_static, treatment[:, :src_len])
+        ps_outputs[:, 0] = ps_pred
 
         input = trg[:, 0].squeeze(-1).float()
+        treatment_cur = treatment[torch.arange(len(treatment)), (torch.sum(src_mask, dim=-1) - 1)]
 
         for t in range(trg_len):
             # insert input token embedding, previous hidden state and the context state
             # receive output tensor (predictions) and new hidden state
-            if t==0:
-                treatment_cur = treatment[torch.arange(len(treatment)), (torch.sum(src_mask, dim=-1) - 1)]
-            else:
-                treatment_cur = treatment[:, src_len+t-1]
             treatment_next = treatment[:, src_len+t]
-            (output, output_cf), (hidden,cell), patient_rep, ps_output, decoder_attention = self.decoder(input, x_static, treatment_cur, treatment_next, hidden, cell, encoder_outputs,src_mask)
-            # if t == 0:
-            #     patient_representations = patient_rep
 
+            (output, output_cf), (hidden, cell), patient_rep, ps_output, decoder_attention = self.decoder(input,
+                                                                                                          x_static,
+                                                                                                          treatment_cur,
+                                                                                                          treatment_next,
+                                                                                                          hidden, cell,
+                                                                                                          encoder_outputs,
+                                                                                                          src_mask)
+
+            treatment_cur = treatment[:, src_len + t]
             # place predictions in a tensor holding predictions for each token
             outputs[:, t] = output
             outputs_cf[:, t] = output_cf
+            # decoder_attentions[:, t] = decoder_attention
             decoder_attentions[:, t] = decoder_attention
-            ps_outputs[:, t] = ps_output
+            ps_outputs[:, t+1] = ps_output
 
             # decide if we are going to use teacher forcing or not
             teacher_force = random.random() < teacher_forcing_ratio
@@ -282,9 +273,5 @@ class Seq2Seq(nn.Module):
             # if not, use predicted token
             input = trg[:, t+1] if teacher_force else top1
 
-        # trg mast
-        # trg_mask = (trg!=0).long().unsqueeze(-1)
-        # outputs = outputs.squeeze(-1) * trg_mask
-        # outputs = outputs
 
         return outputs.squeeze(-1), outputs_cf.squeeze(-1), patient_representations, ps_outputs, decoder_attentions
